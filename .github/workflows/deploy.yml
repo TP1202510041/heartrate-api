@@ -1,0 +1,127 @@
+name: Deploy Heart Rate API to Azure Container Apps
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # Permite deployment manual
+
+env:
+  RESOURCE_GROUP: heartrate-api-rg
+  LOCATION: eastus
+  CONTAINER_APP_ENV: heartrate-env
+  CONTAINER_APP_NAME: heartrate-api
+  CONTAINER_REGISTRY: heartrateregistry${{ github.run_number }}
+  IMAGE_NAME: heartrate-api
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 📁 Checkout code
+      uses: actions/checkout@v4
+      
+    - name: 🔑 Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+        
+    - name: 📦 Create Resource Group
+      run: |
+        az group create \
+          --name ${{ env.RESOURCE_GROUP }} \
+          --location ${{ env.LOCATION }}
+          
+    - name: 🏪 Create Container Registry
+      run: |
+        # Crear registry si no existe
+        if ! az acr show --name ${{ env.CONTAINER_REGISTRY }} --resource-group ${{ env.RESOURCE_GROUP }} > /dev/null 2>&1; then
+          az acr create \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --name ${{ env.CONTAINER_REGISTRY }} \
+            --sku Basic \
+            --admin-enabled true
+        fi
+        
+    - name: 🔨 Build and Push Docker Image
+      run: |
+        az acr build \
+          --registry ${{ env.CONTAINER_REGISTRY }} \
+          --image ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+          --image ${{ env.IMAGE_NAME }}:latest \
+          .
+          
+    - name: 🔑 Get Registry Credentials
+      id: registry
+      run: |
+        REGISTRY_SERVER=$(az acr show --name ${{ env.CONTAINER_REGISTRY }} --resource-group ${{ env.RESOURCE_GROUP }} --query loginServer --output tsv)
+        REGISTRY_USERNAME=$(az acr credential show --name ${{ env.CONTAINER_REGISTRY }} --resource-group ${{ env.RESOURCE_GROUP }} --query username --output tsv)
+        REGISTRY_PASSWORD=$(az acr credential show --name ${{ env.CONTAINER_REGISTRY }} --resource-group ${{ env.RESOURCE_GROUP }} --query passwords[0].value --output tsv)
+        
+        echo "registry_server=$REGISTRY_SERVER" >> $GITHUB_OUTPUT
+        echo "registry_username=$REGISTRY_USERNAME" >> $GITHUB_OUTPUT
+        echo "registry_password=$REGISTRY_PASSWORD" >> $GITHUB_OUTPUT
+        
+    - name: 🌍 Create Container Apps Environment
+      run: |
+        # Crear environment si no existe
+        if ! az containerapp env show --name ${{ env.CONTAINER_APP_ENV }} --resource-group ${{ env.RESOURCE_GROUP }} > /dev/null 2>&1; then
+          az containerapp env create \
+            --name ${{ env.CONTAINER_APP_ENV }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --location ${{ env.LOCATION }}
+        fi
+        
+    - name: 🚢 Deploy to Container Apps
+      run: |
+        # Verificar si la app ya existe
+        if az containerapp show --name ${{ env.CONTAINER_APP_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} > /dev/null 2>&1; then
+          echo "Updating existing container app..."
+          az containerapp update \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image ${{ steps.registry.outputs.registry_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        else
+          echo "Creating new container app..."
+          az containerapp create \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --environment ${{ env.CONTAINER_APP_ENV }} \
+            --image ${{ steps.registry.outputs.registry_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            --registry-server ${{ steps.registry.outputs.registry_server }} \
+            --registry-username ${{ steps.registry.outputs.registry_username }} \
+            --registry-password ${{ steps.registry.outputs.registry_password }} \
+            --target-port 8000 \
+            --ingress external \
+            --min-replicas 0 \
+            --max-replicas 2 \
+            --cpu 0.25 \
+            --memory 0.5Gi
+        fi
+        
+    - name: 📋 Get Application URL
+      id: url
+      run: |
+        FQDN=$(az containerapp show --name ${{ env.CONTAINER_APP_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --query properties.configuration.ingress.fqdn --output tsv)
+        echo "app_url=https://$FQDN" >> $GITHUB_OUTPUT
+        echo "🎉 Deployment successful!"
+        echo "📍 API URL: https://$FQDN"
+        echo "📚 Docs: https://$FQDN/docs"
+        
+    - name: 🧪 Health Check
+      run: |
+        echo "Testing API health..."
+        sleep 30  # Wait for container to start
+        curl -f "${{ steps.url.outputs.app_url }}/" || exit 1
+        echo "✅ API is healthy!"
+        
+    - name: 📝 Create deployment summary
+      run: |
+        echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- **Status**: ✅ Success" >> $GITHUB_STEP_SUMMARY
+        echo "- **API URL**: [${{ steps.url.outputs.app_url }}](${{ steps.url.outputs.app_url }})" >> $GITHUB_STEP_SUMMARY
+        echo "- **Documentation**: [${{ steps.url.outputs.app_url }}/docs](${{ steps.url.outputs.app_url }}/docs)" >> $GITHUB_STEP_SUMMARY
+        echo "- **Image**: \`${{ env.IMAGE_NAME }}:${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Resource Group**: \`${{ env.RESOURCE_GROUP }}\`" >> $GITHUB_STEP_SUMMARY
